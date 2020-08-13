@@ -11,8 +11,13 @@ import argparse
 import os
 import pdb
 
+import  sys
+sys.path.append("../../")
+from networks import  *
+from data_generator import  get_handled_cifar10_test_loader
+
 parser = argparse.ArgumentParser(description='Runs SimBA on a set of images')
-parser.add_argument('--data_root', type=str, required=True, help='root directory of imagenet data')
+# parser.add_argument('--data_root', type=str, required=True, help='root directory of imagenet data')
 parser.add_argument('--result_dir', type=str, default='save', help='directory for saving results')
 parser.add_argument('--sampled_image_dir', type=str, default='save', help='directory to cache sampled images')
 parser.add_argument('--model', type=str, default='resnet50', help='type of base model to use')
@@ -28,6 +33,9 @@ parser.add_argument('--stride', type=int, default=7, help='stride for block orde
 parser.add_argument('--targeted', action='store_true', help='perform targeted attack')
 parser.add_argument('--pixel_attack', action='store_true', help='attack in pixel space')
 parser.add_argument('--save_suffix', type=str, default='', help='suffix appended to save file')
+
+parser.add_argument('--resume_path', type=str, default='')
+
 args = parser.parse_args()
 
 def expand_vector(x, size):
@@ -41,12 +49,14 @@ def normalize(x):
     return utils.apply_normalization(x, 'imagenet')
 
 def get_probs(model, x, y):
-    output = model(normalize(torch.autograd.Variable(x.cuda()))).cpu()
+    # output = model(normalize(torch.autograd.Variable(x.cuda()))).cpu()
+    output = model(torch.autograd.Variable(x.cuda())).cpu()
     probs = torch.index_select(torch.nn.Softmax()(output).data, 1, y)
     return torch.diag(probs)
 
 def get_preds(model, x):
-    output = model(normalize(torch.autograd.Variable(x.cuda()))).cpu()
+    output = model(torch.autograd.Variable(x.cuda())).cpu()
+    # output = model(normalize(torch.autograd.Variable(x.cuda()))).cpu()
     _, preds = output.data.max(1)
     return preds
 
@@ -162,34 +172,13 @@ if not os.path.exists(args.result_dir):
 if not os.path.exists(args.sampled_image_dir):
     os.mkdir(args.sampled_image_dir)
 
-# load model and dataset
-model = getattr(models, args.model)(pretrained=True).cuda()
+# load model
+model = torch.load(args.resume_path).cuda()
 model.eval()
-if args.model.startswith('inception'):
-    image_size = 299
-    testset = dset.ImageFolder(args.data_root + '/val', utils.INCEPTION_TRANSFORM)
-else:
-    image_size = 224
-    testset = dset.ImageFolder(args.data_root + '/val', utils.IMAGENET_TRANSFORM)
 
-# load sampled images or sample new ones
-# this is to ensure all attacks are run on the same set of correctly classified images
-batchfile = '%s/images_%s_%d.pth' % (args.sampled_image_dir, args.model, args.num_runs)
-if os.path.isfile(batchfile):
-    checkpoint = torch.load(batchfile)
-    images = checkpoint['images']
-    labels = checkpoint['labels']
-else:
-    images = torch.zeros(args.num_runs, 3, image_size, image_size)
-    labels = torch.zeros(args.num_runs).long()
-    preds = labels + 1
-    while preds.ne(labels).sum() > 0:
-        idx = torch.arange(0, images.size(0)).long()[preds.ne(labels)]
-        for i in list(idx):
-            images[i], labels[i] = testset[random.randint(0, len(testset) - 1)]
-        preds[idx], _ = utils.get_preds(model, images[idx], 'imagenet', batch_size=args.batch_size)
-    torch.save({'images': images, 'labels': labels}, batchfile)
-
+#load data
+test_loader = get_handled_cifar10_test_loader(batch_size=args.batch_size, num_workers=0, shuffle=False)
+image_size = 32
 if args.order == 'rand':
     n_dims = 3 * args.freq_dims * args.freq_dims
 else:
@@ -198,41 +187,85 @@ if args.num_iters > 0:
     max_iters = int(min(n_dims, args.num_iters))
 else:
     max_iters = int(n_dims)
-N = int(math.floor(float(args.num_runs) / float(args.batch_size)))
-for i in range(N):
-    upper = min((i + 1) * args.batch_size, args.num_runs)
-    images_batch = images[(i * args.batch_size):upper]
-    labels_batch = labels[(i * args.batch_size):upper]
-    # replace true label with random target labels in case of targeted attack
-    if args.targeted:
-        labels_targeted = labels_batch.clone()
-        while labels_targeted.eq(labels_batch).sum() > 0:
-            labels_targeted = torch.floor(1000 * torch.rand(labels_batch.size())).long()
-        labels_batch = labels_targeted
+
+for data,target in test_loader:
     adv, probs, succs, queries, l2_norms, linf_norms = dct_attack_batch(
-        model, images_batch, labels_batch, max_iters, args.freq_dims, args.stride, args.epsilon, order=args.order,
-        targeted=args.targeted, pixel_attack=args.pixel_attack, log_every=args.log_every)
-    if i == 0:
-        all_adv = adv
-        all_probs = probs
-        all_succs = succs
-        all_queries = queries
-        all_l2_norms = l2_norms
-        all_linf_norms = linf_norms
-    else:
-        all_adv = torch.cat([all_adv, adv], dim=0)
-        all_probs = torch.cat([all_probs, probs], dim=0)
-        all_succs = torch.cat([all_succs, succs], dim=0)
-        all_queries = torch.cat([all_queries, queries], dim=0)
-        all_l2_norms = torch.cat([all_l2_norms, l2_norms], dim=0)
-        all_linf_norms = torch.cat([all_linf_norms, linf_norms], dim=0)
-    if args.pixel_attack:
-        prefix = 'pixel'
-    else:
-        prefix = 'dct'
-    if args.targeted:
-        prefix += '_targeted'
-    savefile = '%s/%s_%s_%d_%d_%d_%.4f_%s%s.pth' % (
-        args.result_dir, prefix, args.model, args.num_runs, args.num_iters, args.freq_dims, args.epsilon, args.order, args.save_suffix)
-    torch.save({'adv': all_adv, 'probs': all_probs, 'succs': all_succs, 'queries': all_queries,
-                'l2_norms': all_l2_norms, 'linf_norms': all_linf_norms}, savefile)
+            model, data, target, max_iters, args.freq_dims, args.stride, args.epsilon, order=args.order,
+            targeted=args.targeted, pixel_attack=args.pixel_attack, log_every=args.log_every)
+    print(adv.size())
+
+#
+# # load model and dataset
+# model = getattr(models, args.model)(pretrained=True).cuda()
+# model.eval()
+# if args.model.startswith('inception'):
+#     image_size = 299
+#     testset = dset.ImageFolder(args.data_root + '/val', utils.INCEPTION_TRANSFORM)
+# else:
+#     image_size = 224
+#     testset = dset.ImageFolder(args.data_root + '/val', utils.IMAGENET_TRANSFORM)
+#
+# # load sampled images or sample new ones
+# # this is to ensure all attacks are run on the same set of correctly classified images
+# batchfile = '%s/images_%s_%d.pth' % (args.sampled_image_dir, args.model, args.num_runs)
+# if os.path.isfile(batchfile):
+#     checkpoint = torch.load(batchfile)
+#     images = checkpoint['images']
+#     labels = checkpoint['labels']
+# else:
+#     images = torch.zeros(args.num_runs, 3, image_size, image_size)
+#     labels = torch.zeros(args.num_runs).long()
+#     preds = labels + 1
+#     while preds.ne(labels).sum() > 0:
+#         idx = torch.arange(0, images.size(0)).long()[preds.ne(labels)]
+#         for i in list(idx):
+#             images[i], labels[i] = testset[random.randint(0, len(testset) - 1)]
+#         preds[idx], _ = utils.get_preds(model, images[idx], 'imagenet', batch_size=args.batch_size)
+#     torch.save({'images': images, 'labels': labels}, batchfile)
+#
+# if args.order == 'rand':
+#     n_dims = 3 * args.freq_dims * args.freq_dims
+# else:
+#     n_dims = 3 * image_size * image_size
+# if args.num_iters > 0:
+#     max_iters = int(min(n_dims, args.num_iters))
+# else:
+#     max_iters = int(n_dims)
+# N = int(math.floor(float(args.num_runs) / float(args.batch_size)))
+# for i in range(N):
+#     upper = min((i + 1) * args.batch_size, args.num_runs)
+#     images_batch = images[(i * args.batch_size):upper]
+#     labels_batch = labels[(i * args.batch_size):upper]
+#     # replace true label with random target labels in case of targeted attack
+#     if args.targeted:
+#         labels_targeted = labels_batch.clone()
+#         while labels_targeted.eq(labels_batch).sum() > 0:
+#             labels_targeted = torch.floor(1000 * torch.rand(labels_batch.size())).long()
+#         labels_batch = labels_targeted
+#     adv, probs, succs, queries, l2_norms, linf_norms = dct_attack_batch(
+#         model, images_batch, labels_batch, max_iters, args.freq_dims, args.stride, args.epsilon, order=args.order,
+#         targeted=args.targeted, pixel_attack=args.pixel_attack, log_every=args.log_every)
+#     if i == 0:
+#         all_adv = adv
+#         all_probs = probs
+#         all_succs = succs
+#         all_queries = queries
+#         all_l2_norms = l2_norms
+#         all_linf_norms = linf_norms
+#     else:
+#         all_adv = torch.cat([all_adv, adv], dim=0)
+#         all_probs = torch.cat([all_probs, probs], dim=0)
+#         all_succs = torch.cat([all_succs, succs], dim=0)
+#         all_queries = torch.cat([all_queries, queries], dim=0)
+#         all_l2_norms = torch.cat([all_l2_norms, l2_norms], dim=0)
+#         all_linf_norms = torch.cat([all_linf_norms, linf_norms], dim=0)
+#     if args.pixel_attack:
+#         prefix = 'pixel'
+#     else:
+#         prefix = 'dct'
+#     if args.targeted:
+#         prefix += '_targeted'
+#     savefile = '%s/%s_%s_%d_%d_%d_%.4f_%s%s.pth' % (
+#         args.result_dir, prefix, args.model, args.num_runs, args.num_iters, args.freq_dims, args.epsilon, args.order, args.save_suffix)
+#     torch.save({'adv': all_adv, 'probs': all_probs, 'succs': all_succs, 'queries': all_queries,
+#                 'l2_norms': all_l2_norms, 'linf_norms': all_linf_norms}, savefile)
