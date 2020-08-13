@@ -188,11 +188,26 @@ if args.num_iters > 0:
 else:
     max_iters = int(n_dims)
 
+cln_correct = 0
+adv_correct = 0
 for data,target in test_loader:
+    with torch.no_grad():
+        cln_prediction = (model(data.cuda()).max(1,keepdim=True)[1])%10
+    cln_correct += cln_prediction.eq(target.cuda().view_as(cln_prediction)).sum().item()
+
     adv, probs, succs, queries, l2_norms, linf_norms = dct_attack_batch(
             model, data, target, max_iters, args.freq_dims, args.stride, args.epsilon, order=args.order,
             targeted=args.targeted, pixel_attack=args.pixel_attack, log_every=args.log_every)
-    print(adv.size())
+
+    print("max per:{}".format((adv-data).max()))
+    print("min per:{}".format((adv-data).min()))
+
+    with torch.no_grad():
+        adv_prediction = (model(adv.cuda()).max(1,keepdim=True)[1])%10
+    adv_correct += adv_prediction.eq(target.cuda().view_as(adv_prediction)).sum().item()
+
+print("cln acc:{}/{} ({:.4f})".format(cln_correct,len(test_loader.dataset),cln_correct/len(test_loader.dataset)))
+print("adv acc:{}/{} ({:.4f})".format(adv_correct,len(test_loader.dataset),adv_correct/len(test_loader.dataset)))
 
 #
 # # load model and dataset
